@@ -27,11 +27,6 @@ jobs:
             const STATUS_CONTEXT = 'prti-check';
             const { owner, repo } = context.repo;
 
-            # // Prevent infinite loop if comment is created by a bot
-            # if (context.eventName === 'issue_comment' && context.payload.sender.type === 'Bot') {
-            #   core.info('Comment created by a Bot. Skipping execution.');
-            #   return;
-            # }
             // Prevent infinite loop if comment is created by the GitHub Actions bot
             if (context.eventName === 'issue_comment' && context.payload.comment.user.login === 'github-actions[bot]') {
               core.info('Comment created by GitHub Actions bot. Skipping execution.');
