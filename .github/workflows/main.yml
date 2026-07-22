@@ -53,7 +53,7 @@ jobs:
             const isSynchronize = context.eventName === 'pull_request' && context.payload.action === 'synchronize';
             const prtiRegex = /PR\s*Time|PR\s*Defects|TI\s*Time/i;
 
-            // 1. If new commits were pushed (synchronize), delete old PRTI comments posted by the author
+            // 1. Delete old PRTI comments on new commits
             if (isSynchronize) {
               core.info('New commit(s) pushed. Cleaning up obsolete PRTI comments...');
               const prtiCommentsToDelete = comments.filter(c => 
@@ -70,14 +70,13 @@ jobs:
                 core.info(`Deleted obsolete PRTI comment ID: ${comment.id}`);
               }
 
-              // Re-fetch comments list after deletion
               comments = await github.paginate(
                 github.rest.issues.listComments,
                 { owner, repo, issue_number: prNumber, per_page: 100 }
               );
             }
 
-            // 2. Scan PR Description & remaining author comments for PRTI data
+            // 2. Scan PR Description & author comments
             const authorComments = comments
               .filter(c => c.user && c.user.login === author)
               .filter(c => !(c.body || '').includes(MARKER))
@@ -85,22 +84,54 @@ jobs:
 
             const haystack = [pr.body || '', ...authorComments].join('\n');
 
+            // 3. Validation Logic Engine
             const checks = [
-              { label: 'PR Time',    re: /PR\s*Time\s*:\s*(\S.*)?$/im },
-              { label: 'PR Defects', re: /PR\s*Defects\s*:\s*(\S.*)?$/im },
-              { label: 'TI Time',    re: /TI\s*Time\s*:\s*(\S.*)?$/im },
+              { label: 'PR Time',    re: /PR\s*Time\s*:\s*(\S.*)?$/im,    type: 'time' },
+              { label: 'PR Defects', re: /PR\s*Defects\s*:\s*(\S.*)?$/im, type: 'number' },
+              { label: 'TI Time',    re: /TI\s*Time\s*:\s*(\S.*)?$/im,    type: 'time' },
             ];
 
-            const missing = [];
+            const invalidFields = [];
+
             for (const c of checks) {
               const m = haystack.match(c.re);
-              const value = m && m[1] ? m[1].trim() : '';
-              if (!value) missing.push(c.label);
+              const rawValue = m && m[1] ? m[1].trim() : '';
+
+              // Check 1: Empty or whitespace only
+              if (!rawValue) {
+                invalidFields.push(`${c.label} (Empty/Missing)`);
+                continue;
+              }
+
+              // Check 2: Reject placeholders (e.g. <enter time...>, N/A, TBD, TODO)
+              if (/^<.*>$/i.test(rawValue) \vert{}\vert{} /^(n\/a\vert{}na\vert{}tbd\vert{}todo\vert{}\?+)$/i.test(rawValue)) {
+                invalidFields.push(`${c.label} (Invalid placeholder: "${rawValue}")`);
+                continue;
+              }
+
+              // Check 3: Reject negative numbers
+              if (rawValue.includes('-')) {
+                invalidFields.push(`${c.label} (Cannot be negative: "${rawValue}")`);
+                continue;
+              }
+
+              // Check 4: Type-specific validation
+              if (c.type === 'number') {
+                // Must strictly be a non-negative integer (e.g. 0, 1, 2)
+                if (!/^\d+$/.test(rawValue)) {
+                  invalidFields.push(`${c.label} (Must be a non-negative number, e.g., 0)`);
+                }
+              } else if (c.type === 'time') {
+                // Time must contain at least one digit (e.g., 2h, 1.5h, 30m, 0)
+                if (!/\d/.test(rawValue)) {
+                  invalidFields.push(`${c.label} (Must contain a valid time duration, e.g., 2h or 30m)`);
+                }
+              }
             }
 
-            const allProvided = missing.length === 0;
+            const allValid = invalidFields.length === 0;
 
-            // 3. Build status message and contextual banners
+            // 4. Build status message and contextual banners
             let bannerLines = [];
 
             if (isSynchronize) {
@@ -109,33 +140,34 @@ jobs:
                 '> Previous PRTI data has been invalidated. Please submit updated PRTI details for this new revision.',
                 ''
               ];
-            } else if (context.eventName === 'issue_comment' && !allProvided) {
+            } else if (context.eventName === 'issue_comment' && !allValid) {
               const latestCommentBody = context.payload.comment.body || '';
               if (prtiRegex.test(latestCommentBody)) {
                 bannerLines = [
                   '> ⚠️ **Notice on your recent comment:**',
-                  '> We detected a PRTI submission attempt, but some fields were missing or empty.',
+                  '> We detected a PRTI submission attempt, but some fields failed validation.',
                   ''
                 ];
               }
             }
 
             let statusLines;
-            if (allProvided) {
+            if (allValid) {
               statusLines = [
                 '### PRTI Checklist Complete',
-                'All required PRTI fields were detected for the current revision. Thank you!'
+                'All required PRTI fields were detected and validated for the current revision. Thank you!'
               ];
             } else {
               statusLines = [
-                '### PRTI Checklist Incomplete',
-                'The following field(s) are missing or empty: **' + missing.join(', ') + '**',
+                '### PRTI Checklist Incomplete or Invalid',
+                'The following issue(s) need attention:',
+                ...invalidFields.map(err => `- **${err}**`),
                 '',
-                'This PR is **blocked from merging** until updated PRTI data is supplied.'
+                'This PR is **blocked from merging** until valid PRTI data is supplied.'
               ];
             }
 
-            // 4. Assemble the full sticky comment body
+            // 5. Assemble full sticky comment body
             const bodyLines = [
               MARKER,
               '## PRTI Checklist Enforcement',
@@ -146,15 +178,15 @@ jobs:
               '### Required Format (Copy & Paste):',
               '```text',
               'PR Time    : <enter time, e.g., 2h>',
-              'PR Defects : <enter defects, e.g., 0 or None>',
+              'PR Defects : <enter defects count, e.g., 0>',
               'TI Time    : <enter time, e.g., 1h>',
               '```',
               '',
-              '| Field | Meaning |',
-              '|-------|---------|',
-              '| **PR Time** | Time spent creating this PR |',
-              '| **PR Defects** | Defects found during review |',
-              '| **TI Time** | Time spent on Technical Investigation |',
+              '| Field | Validation Rule | Meaning |',
+              '|-------|-----------------|---------|',
+              '| **PR Time** | Time duration (e.g. `2h`, `30m`) | Time spent creating this PR |',
+              '| **PR Defects** | Non-negative number (e.g. `0`, `1`) | Defects found during review |',
+              '| **TI Time** | Time duration (e.g. `1h`, `45m`) | Time spent on Technical Investigation |',
               '',
               '---',
               ...statusLines,
@@ -164,7 +196,7 @@ jobs:
 
             const body = bodyLines.join('\n');
 
-            // 5. Create or update the sticky comment
+            // 6. Update or create the sticky comment
             const existingSticky = comments.find(c => (c.body || '').includes(MARKER));
 
             if (existingSticky) {
@@ -177,23 +209,23 @@ jobs:
               });
             }
 
-            // 6. Update the GitHub Commit Status Check
-            const description = allProvided
+            // 7. Update Commit Status
+            const description = allValid
               ? 'PRTI checklist complete'
-              : ('Missing: ' + missing.join(', ')).slice(0, 140);
+              : ('Validation failed: ' + invalidFields.join(', ')).slice(0, 140);
 
             await github.rest.repos.createCommitStatus({
               owner,
               repo,
               sha: headSha,
               context: STATUS_CONTEXT,
-              state: allProvided ? 'success' : 'failure',
+              state: allValid ? 'success' : 'failure',
               description,
               target_url: 'https://github.com/' + owner + '/' + repo + '/pull/' + prNumber
             });
 
-            if (allProvided) {
+            if (allValid) {
               core.info('PRTI checklist complete - commit status set to success.');
             } else {
-              core.warning('PRTI checklist incomplete. Missing: ' + missing.join(', '));
+              core.warning('PRTI checklist incomplete or invalid. Issues: ' + invalidFields.join(', '));
             }
