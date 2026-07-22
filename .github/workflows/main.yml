@@ -1,22 +1,23 @@
 name: PRTI Enforcement
- 
+
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
   issue_comment:
     types: [created, edited]
- 
+
 permissions:
   pull-requests: write
   issues: write
   statuses: write
- 
+
 jobs:
   prti-check:
     if: >-
       github.event_name == 'pull_request' ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request)
     runs-on: ubuntu-latest
+
     steps:
       - name: Validate PRTI data, update sticky comment, set commit status
         uses: actions/github-script@v7
@@ -24,75 +25,129 @@ jobs:
           script: |
             const MARKER = '<!-- prti-reminder-sticky -->';
             const STATUS_CONTEXT = 'prti-check';
- 
             const { owner, repo } = context.repo;
- 
+
+            // Prevent infinite loop if comment is created by a bot
+            if (context.eventName === 'issue_comment' && context.payload.sender.type === 'Bot') {
+              core.info('Comment created by a Bot. Skipping execution.');
+              return;
+            }
+
             const prNumber = context.eventName === 'issue_comment'
               ? context.payload.issue.number
               : context.payload.pull_request.number;
- 
+
             const { data: pr } = await github.rest.pulls.get({
               owner, repo, pull_number: prNumber
             });
+
             const headSha = pr.head.sha;
- 
-            const comments = await github.paginate(
+            const author = pr.user ? pr.user.login : 'there';
+
+            // Fetch all comments on the PR
+            let comments = await github.paginate(
               github.rest.issues.listComments,
               { owner, repo, issue_number: prNumber, per_page: 100 }
             );
- 
-            const haystack = [
-              pr.body || '',
-              ...comments
-                .filter(c => !(c.body || '').includes(MARKER))
-                .map(c => c.body || '')
-            ].join('\n');
- 
+
+            const isSynchronize = context.eventName === 'pull_request' && context.payload.action === 'synchronize';
+            const prtiRegex = /PR\s*Time|PR\s*Defects|TI\s*Time/i;
+
+            // 1. If new commits were pushed (synchronize), delete old PRTI comments posted by the author
+            if (isSynchronize) {
+              core.info('New commit(s) pushed. Cleaning up obsolete PRTI comments...');
+              const prtiCommentsToDelete = comments.filter(c => 
+                c.user && 
+                c.user.login === author && 
+                !c.body.includes(MARKER) && 
+                prtiRegex.test(c.body)
+              );
+
+              for (const comment of prtiCommentsToDelete) {
+                await github.rest.issues.deleteComment({
+                  owner, repo, comment_id: comment.id
+                });
+                core.info(`Deleted obsolete PRTI comment ID: ${comment.id}`);
+              }
+
+              // Re-fetch comments list after deletion
+              comments = await github.paginate(
+                github.rest.issues.listComments,
+                { owner, repo, issue_number: prNumber, per_page: 100 }
+              );
+            }
+
+            // 2. Scan PR Description & remaining author comments for PRTI data
+            const authorComments = comments
+              .filter(c => c.user && c.user.login === author)
+              .filter(c => !(c.body || '').includes(MARKER))
+              .map(c => c.body || '');
+
+            const haystack = [pr.body || '', ...authorComments].join('\n');
+
             const checks = [
               { label: 'PR Time',    re: /PR\s*Time\s*:\s*(\S.*)?$/im },
               { label: 'PR Defects', re: /PR\s*Defects\s*:\s*(\S.*)?$/im },
               { label: 'TI Time',    re: /TI\s*Time\s*:\s*(\S.*)?$/im },
             ];
- 
+
             const missing = [];
             for (const c of checks) {
               const m = haystack.match(c.re);
               const value = m && m[1] ? m[1].trim() : '';
               if (!value) missing.push(c.label);
             }
+
             const allProvided = missing.length === 0;
- 
-            const author = pr.user ? pr.user.login : 'there';
- 
-            // Build status block as an array of lines (no multi-line backticks)
+
+            // 3. Build status message and contextual banners
+            let bannerLines = [];
+
+            if (isSynchronize) {
+              bannerLines = [
+                '> 🔄 **New Commits Detected!**',
+                '> Previous PRTI data has been invalidated. Please submit updated PRTI details for this new revision.',
+                ''
+              ];
+            } else if (context.eventName === 'issue_comment' && !allProvided) {
+              const latestCommentBody = context.payload.comment.body || '';
+              if (prtiRegex.test(latestCommentBody)) {
+                bannerLines = [
+                  '> ⚠️ **Notice on your recent comment:**',
+                  '> We detected a PRTI submission attempt, but some fields were missing or empty.',
+                  ''
+                ];
+              }
+            }
+
             let statusLines;
             if (allProvided) {
               statusLines = [
                 '### PRTI Checklist Complete',
-                'All required PRTI fields were detected. Thank you!'
+                'All required PRTI fields were detected for the current revision. Thank you!'
               ];
             } else {
               statusLines = [
                 '### PRTI Checklist Incomplete',
                 'The following field(s) are missing or empty: **' + missing.join(', ') + '**',
                 '',
-                'This PR is **blocked from merging** until the checklist is completed.'
+                'This PR is **blocked from merging** until updated PRTI data is supplied.'
               ];
             }
- 
-            // Build the full comment body line-by-line, then join with newlines
+
+            // 4. Assemble the full sticky comment body
             const bodyLines = [
               MARKER,
-              '## PRTI Checklist',
+              '## PRTI Checklist Enforcement',
               '',
-              'Hi @' + author + ', please add a **PRTI comment** and fill in the',
-              'checklist below (in the PR description **or** a comment).',
-              'Fill every field with a value:',
+              ...bannerLines,
+              'Hi @' + author + ', please provide your **PRTI details** in the PR description or a comment.',
               '',
-              '```',
-              'PR Time    : ',
-              'PR Defects : ',
-              'TI Time    : ',
+              '### Required Format (Copy & Paste):',
+              '```text',
+              'PR Time    : <enter time, e.g., 2h>',
+              'PR Defects : <enter defects, e.g., 0 or None>',
+              'TI Time    : <enter time, e.g., 1h>',
               '```',
               '',
               '| Field | Meaning |',
@@ -104,25 +159,29 @@ jobs:
               '---',
               ...statusLines,
               '',
-              '> Automated by the PRTI Enforcement workflow. This comment updates itself in place.'
+              '> Automated by the PRTI Enforcement workflow. Re-evaluates on new commits.'
             ];
+
             const body = bodyLines.join('\n');
- 
-            const existing = comments.find(c => (c.body || '').includes(MARKER));
-            if (existing) {
+
+            // 5. Create or update the sticky comment
+            const existingSticky = comments.find(c => (c.body || '').includes(MARKER));
+
+            if (existingSticky) {
               await github.rest.issues.updateComment({
-                owner, repo, comment_id: existing.id, body
+                owner, repo, comment_id: existingSticky.id, body
               });
             } else {
               await github.rest.issues.createComment({
                 owner, repo, issue_number: prNumber, body
               });
             }
- 
+
+            // 6. Update the GitHub Commit Status Check
             const description = allProvided
               ? 'PRTI checklist complete'
               : ('Missing: ' + missing.join(', ')).slice(0, 140);
- 
+
             await github.rest.repos.createCommitStatus({
               owner,
               repo,
@@ -132,7 +191,7 @@ jobs:
               description,
               target_url: 'https://github.com/' + owner + '/' + repo + '/pull/' + prNumber
             });
- 
+
             if (allProvided) {
               core.info('PRTI checklist complete - commit status set to success.');
             } else {
