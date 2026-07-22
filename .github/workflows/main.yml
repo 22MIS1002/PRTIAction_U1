@@ -27,7 +27,7 @@ jobs:
             const STATUS_CONTEXT = 'prti-check';
             const { owner, repo } = context.repo;
 
-            // Prevent infinite loop if comment is created by the GitHub Actions bot
+            // Prevent infinite loop if comment is created by GitHub Actions bot
             if (context.eventName === 'issue_comment' && context.payload.comment.user.login === 'github-actions[bot]') {
               core.info('Comment created by GitHub Actions bot. Skipping execution.');
               return;
@@ -76,35 +76,46 @@ jobs:
               );
             }
 
-            // 2. Scan PR Description & author comments
+            // 2. Scan PR Description & author comments (reversed to get newest comments first)
             const authorComments = comments
               .filter(c => c.user && c.user.login === author)
               .filter(c => !(c.body || '').includes(MARKER))
               .map(c => c.body || '');
 
-            const haystack = [pr.body || '', ...authorComments].join('\n');
+            // Order sources: Newest comment first, falling back to PR description
+            const textSources = [...authorComments.reverse(), pr.body || ''];
+
+            // Helper function to extract the most recent value for a given field regex
+            function getLatestValue(regex) {
+              for (const text of textSources) {
+                const match = text.match(regex);
+                if (match && match[1] !== undefined) {
+                  return match[1].trim();
+                }
+              }
+              return null;
+            }
 
             // 3. Validation Logic Engine
             const checks = [
-              { label: 'PR Time',    re: /PR\s*Time\s*:\s*(\S.*)?$/im,    type: 'time' },
-              { label: 'PR Defects', re: /PR\s*Defects\s*:\s*(\S.*)?$/im, type: 'number' },
-              { label: 'TI Time',    re: /TI\s*Time\s*:\s*(\S.*)?$/im,    type: 'time' },
+              { label: 'PR Time',    re: /PR\s*Time\s*:\s*(.*)$/im,    type: 'time' },
+              { label: 'PR Defects', re: /PR\s*Defects\s*:\s*(.*)$/im, type: 'number' },
+              { label: 'TI Time',    re: /TI\s*Time\s*:\s*(.*)$/im,    type: 'time' },
             ];
 
             const invalidFields = [];
 
             for (const c of checks) {
-              const m = haystack.match(c.re);
-              const rawValue = m && m[1] ? m[1].trim() : '';
+              const rawValue = getLatestValue(c.re);
 
               // Check 1: Empty or whitespace only
-              if (!rawValue) {
+              if (rawValue === null || rawValue === '') {
                 invalidFields.push(`${c.label} (Empty/Missing)`);
                 continue;
               }
-              
+
               // Check 2: Reject placeholders (e.g. <enter time...>, N/A, TBD, TODO)
-              if (/^<.*>$/i.test(rawValue) || /^(n\/a|na|tbd|todo|\?+)$/i.test(rawValue)) {
+              if (/^<.*>$/i.test(rawValue) \vert{}\vert{} /^(n\/a\vert{}na\vert{}tbd\vert{}todo\vert{}\?+)$/i.test(rawValue)) {
                 invalidFields.push(`${c.label} (Invalid placeholder: "${rawValue}")`);
                 continue;
               }
