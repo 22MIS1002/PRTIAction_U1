@@ -194,7 +194,7 @@ jobs:
  
               // Check 2: Reject placeholders (e.g. <enter time...>, N/A, TBD, TODO)
 
-              if (/^<.*>$/i.test(rawValue) \vert{}\vert{} /^(n\/a\vert{}na\vert{}tbd\vert{}todo\vert{}\?+)$/i.test(rawValue)) {
+              if (/^<.*>$/i.test(rawValue) || /^(n\/a|na|tbd|todo|\?+)$/i.test(rawValue)) {
 
                 level1Errors.push(`${c.label} (Invalid placeholder: "${rawValue}")`);
 
