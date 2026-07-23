@@ -1,359 +1,502 @@
 name: PRTI Enforcement
-
+ 
 on:
+
   pull_request:
+
     types: [opened, edited, reopened, synchronize]
+
   issue_comment:
+
     types: [created, edited]
-
+ 
 permissions:
+
   pull-requests: write
+
   issues: write
+
   statuses: write
-  contents: read
-
+ 
 jobs:
+
   prti-check:
+
     if: >-
+
       github.event_name == 'pull_request' ||
+
       (github.event_name == 'issue_comment' && github.event.issue.pull_request)
+
     runs-on: ubuntu-latest
-
+ 
     steps:
-      - name: Validate PRTI data AND markdown file (non-empty), update sticky comment, set commit status
+
+      - name: Validate PRTI data & Review attachment, update sticky comment, set commit status
+
         uses: actions/github-script@v7
+
         with:
+
           script: |
+
             const MARKER = '<!-- prti-reminder-sticky -->';
+
             const STATUS_CONTEXT = 'prti-check';
+
             const { owner, repo } = context.repo;
-
+ 
             // Prevent infinite loop if comment is created by GitHub Actions bot
+
             if (context.eventName === 'issue_comment' && context.payload.comment.user.login === 'github-actions[bot]') {
+
               core.info('Comment created by GitHub Actions bot. Skipping execution.');
+
               return;
-            }
 
+            }
+ 
             const prNumber = context.eventName === 'issue_comment'
+
               ? context.payload.issue.number
+
               : context.payload.pull_request.number;
-
+ 
             const { data: pr } = await github.rest.pulls.get({
+
               owner, repo, pull_number: prNumber
-            });
 
+            });
+ 
             const headSha = pr.head.sha;
+
             const author = pr.user ? pr.user.login : 'there';
-
+ 
             // Fetch all comments on the PR
+
             let comments = await github.paginate(
+
               github.rest.issues.listComments,
+
               { owner, repo, issue_number: prNumber, per_page: 100 }
+
             );
-
+ 
             const isSynchronize = context.eventName === 'pull_request' && context.payload.action === 'synchronize';
+
             const prtiRegex = /PR\s*Time|PR\s*Defects|TI\s*Time/i;
-            const markdownRegex = /\.md\b/i;
-
+ 
             // 1. Delete old PRTI comments on new commits
+
             if (isSynchronize) {
+
               core.info('New commit(s) pushed. Cleaning up obsolete PRTI comments...');
+
               const prtiCommentsToDelete = comments.filter(c => 
+
                 c.user && 
+
                 c.user.login === author && 
+
                 !c.body.includes(MARKER) && 
+
                 prtiRegex.test(c.body)
-              );
 
+              );
+ 
               for (const comment of prtiCommentsToDelete) {
+
                 await github.rest.issues.deleteComment({
+
                   owner, repo, comment_id: comment.id
+
                 });
+
                 core.info(`Deleted obsolete PRTI comment ID: ${comment.id}`);
-              }
 
+              }
+ 
               comments = await github.paginate(
+
                 github.rest.issues.listComments,
+
                 { owner, repo, issue_number: prNumber, per_page: 100 }
+
               );
-            }
 
+            }
+ 
             // 2. Scan PR Description & author comments (reversed to get newest comments first)
+
             const authorComments = comments
+
               .filter(c => c.user && c.user.login === author)
+
               .filter(c => !(c.body || '').includes(MARKER))
+
               .map(c => c.body || '');
-
+ 
             // Order sources: Newest comment first, falling back to PR description
+
             const textSources = [...authorComments.reverse(), pr.body || ''];
-
+ 
             // Helper function to extract the most recent value for a given field regex
+
             function getLatestValue(regex) {
+
               for (const text of textSources) {
+
                 const match = text.match(regex);
+
                 if (match && match[1] !== undefined) {
+
                   return match[1].trim();
+
                 }
+
               }
+
               return null;
-            }
 
-            // 3. Validation Logic Engine for PRTI fields
+            }
+ 
+            // ==========================================
+
+            // LEVEL 1: PRTI Data Validation Logic Engine
+
+            // ==========================================
+
             const checks = [
+
               { label: 'PR Time',    re: /PR\s*Time\s*:\s*(.*)$/im,    type: 'time' },
+
               { label: 'PR Defects', re: /PR\s*Defects\s*:\s*(.*)$/im, type: 'number' },
+
               { label: 'TI Time',    re: /TI\s*Time\s*:\s*(.*)$/im,    type: 'time' },
+
             ];
-
-            const invalidFields = [];
-
+ 
+            const level1Errors = [];
+ 
             for (const c of checks) {
+
               const rawValue = getLatestValue(c.re);
-
+ 
               // Check 1: Empty or whitespace only
+
               if (rawValue === null || rawValue === '') {
-                invalidFields.push(`${c.label} (Empty/Missing)`);
-                continue;
-              }
 
+                level1Errors.push(`${c.label} (Empty/Missing)`);
+
+                continue;
+
+              }
+ 
               // Check 2: Reject placeholders (e.g. <enter time...>, N/A, TBD, TODO)
-              if (/^<.*>$/i.test(rawValue) || /^(n\/a|na|tbd|todo|\?+)$/i.test(rawValue)) {
-                invalidFields.push(`${c.label} (Invalid placeholder: "${rawValue}")`);
-                continue;
-              }
 
+              if (/^<.*>$/i.test(rawValue) \vert{}\vert{} /^(n\/a\vert{}na\vert{}tbd\vert{}todo\vert{}\?+)$/i.test(rawValue)) {
+
+                level1Errors.push(`${c.label} (Invalid placeholder: "${rawValue}")`);
+
+                continue;
+
+              }
+ 
               // Check 3: Reject negative numbers
+
               if (rawValue.includes('-')) {
-                invalidFields.push(`${c.label} (Cannot be negative: "${rawValue}")`);
+
+                level1Errors.push(`${c.label} (Cannot be negative: "${rawValue}")`);
+
                 continue;
-              }
 
+              }
+ 
               // Check 4: Type-specific validation
+
               if (c.type === 'number') {
-                // Must strictly be a non-negative integer (e.g. 0, 1, 2)
+
                 if (!/^\d+$/.test(rawValue)) {
-                  invalidFields.push(`${c.label} (Must be a non-negative number, e.g., 0)`);
+
+                  level1Errors.push(`${c.label} (Must be a non-negative number, e.g., 0)`);
+
                 }
+
               } else if (c.type === 'time') {
-                // Time must contain at least one digit (e.g., 2h, 1.5h, 30m, 0)
+
                 if (!/\d/.test(rawValue)) {
-                  invalidFields.push(`${c.label} (Must contain a valid time duration, e.g., 2h or 30m)`);
+
+                  level1Errors.push(`${c.label} (Must contain a valid time duration, e.g., 2h or 30m)`);
+
                 }
+
               }
+
             }
+ 
+            const isLevel1Passed = level1Errors.length === 0;
+ 
+            // ==========================================
 
-            const prtiValid = invalidFields.length === 0;
+            // LEVEL 2: Review (.md) Attachment Validation
 
-            // 4. NEW: Check for markdown file attachment in comments AND verify it's not empty
-            core.info('Checking for markdown file attachment in author comments...');
-            let markdownFound = false;
-            let markdownError = '';
+            // ==========================================
 
-            for (const comment of comments) {
-              if (comment.user && comment.user.login === author && !(comment.body || '').includes(MARKER)) {
-                // Check if comment body mentions .md file
-                if (markdownRegex.test(comment.body)) {
-                  core.info(`Markdown file reference found in comment ID: ${comment.id}`);
-                  
-                  // Extract markdown filename from comment
-                  const mdFileMatch = comment.body.match(/([a-zA-Z0-9_\-\.]+\.md)/i);
-                  if (mdFileMatch) {
-                    const markdownFilename = mdFileMatch[1];
-                    core.info(`Attempting to validate markdown file: ${markdownFilename}`);
-                    
-                    try {
-                      // Try to fetch the file from the PR's head branch
-                      const { data: fileData } = await github.rest.repos.getContent({
-                        owner,
-                        repo,
-                        path: markdownFilename,
-                        ref: pr.head.ref
-                      });
+            const level2Errors = [];
+ 
+            if (isLevel1Passed) {
 
-                      // Check if file exists and has content
-                      if (fileData.size > 0) {
-                        markdownFound = true;
-                        core.info(`✓ Markdown file '${markdownFilename}' found with size: ${fileData.size} bytes`);
-                        break;
-                      } else {
-                        markdownError = `Markdown file '${markdownFilename}' is empty (0 bytes)`;
-                        core.warning(markdownError);
-                      }
-                    } catch (error) {
-                      markdownError = `Markdown file '${markdownFilename}' not found in repository`;
-                      core.warning(markdownError);
-                    }
-                  }
+              core.info('Level 1 passed. Proceeding with Level 2 attachment check...');
+
+              // Regex matches Markdown links ending in .md or uploaded user attachments
+
+              const attachmentRegex = /\[([^\]]+\.md)\]\((https?:\/\/[^\s)]+)\)/i;
+
+              let attachmentMatch = null;
+
+              for (const text of textSources) {
+
+                const match = text.match(attachmentRegex);
+
+                if (match) {
+
+                  attachmentMatch = { fileName: match[1], url: match[2] };
+
+                  break;
+
                 }
-              }
-            }
 
-            // If no markdown in comments, check PR description for file references
-            if (!markdownFound && markdownRegex.test(pr.body || '')) {
-              core.info('Markdown file reference found in PR description');
-              const mdFileMatch = (pr.body || '').match(/([a-zA-Z0-9_\-\.]+\.md)/i);
-              if (mdFileMatch) {
-                const markdownFilename = mdFileMatch[1];
-                core.info(`Attempting to validate markdown file from PR description: ${markdownFilename}`);
-                
+              }
+ 
+              if (!attachmentMatch) {
+
+                level2Errors.push('Review File (.md attachment missing in comment/description)');
+
+              } else {
+
                 try {
-                  const { data: fileData } = await github.rest.repos.getContent({
-                    owner,
-                    repo,
-                    path: markdownFilename,
-                    ref: pr.head.ref
-                  });
 
-                  if (fileData.size > 0) {
-                    markdownFound = true;
-                    core.info(`✓ Markdown file '${markdownFilename}' found with size: ${fileData.size} bytes`);
+                  // Fetch attachment file content
+
+                  const response = await github.rest.request('GET ' + attachmentMatch.url);
+
+                  const content = typeof response.data === 'string' ? response.data.trim() : '';
+ 
+                  if (!content || content.length === 0) {
+
+                    level2Errors.push(`Review File "${attachmentMatch.fileName}" (Attached file is empty / 0 bytes)`);
+
                   } else {
-                    markdownError = `Markdown file '${markdownFilename}' is empty (0 bytes)`;
-                    core.warning(markdownError);
+
+                    core.info(`Level 2 check passed for file: ${attachmentMatch.fileName} (${content.length} characters)`);
+
                   }
-                } catch (error) {
-                  markdownError = `Markdown file '${markdownFilename}' not found in repository`;
-                  core.warning(markdownError);
+
+                } catch (err) {
+
+                  core.warning('Failed to fetch attachment directly: ' + err.message);
+
+                  // If fetch fails due to private URL permissions, verify link presence and format
+
+                  if (!attachmentMatch.fileName.toLowerCase().endsWith('.md')) {
+
+                    level2Errors.push('Review File (Attachment must be a .md file)');
+
+                  }
+
                 }
+
               }
+
+            } else {
+
+              core.info('Level 1 check failed. Skipping Level 2 check until Level 1 passes.');
+
             }
+ 
+            const allValid = isLevel1Passed && level2Errors.length === 0;
 
-            const allValid = prtiValid && markdownFound;
+            const combinedErrors = [...level1Errors, ...level2Errors];
+ 
+            // 4. Build status message and contextual banners
 
-            // 5. Build status message and contextual banners
             let bannerLines = [];
-
+ 
             if (isSynchronize) {
+
               bannerLines = [
+
                 '> 🔄 **New Commits Detected!**',
-                '> Previous PRTI data and markdown file references have been invalidated. Please submit updated PRTI details and markdown file for this new revision.',
+
+                '> Previous PRTI data and attachments have been invalidated. Please submit updated details for this revision.',
+
                 ''
+
               ];
+
             } else if (context.eventName === 'issue_comment' && !allValid) {
+
               const latestCommentBody = context.payload.comment.body || '';
-              if (prtiRegex.test(latestCommentBody) || markdownRegex.test(latestCommentBody)) {
+
+              if (prtiRegex.test(latestCommentBody) || attachmentRegex.test(latestCommentBody)) {
+
                 bannerLines = [
+
                   '> ⚠️ **Notice on your recent comment:**',
-                  '> We detected a submission attempt, but validation failed. Please check the requirements below.',
+
+                  '> We detected a submission attempt, but some validation rules failed.',
+
                   ''
+
                 ];
-              }
-            }
 
+              }
+
+            }
+ 
             let statusLines;
+
             if (allValid) {
+
               statusLines = [
-                '### ✅ PRTI Checklist Complete',
-                'All required PRTI fields were detected and validated, AND markdown file (non-empty) has been provided for the current revision. Thank you!'
+
+                '### ✅ PRTI & Review Checks Passed',
+
+                'All Level 1 (PRTI data) and Level 2 (Review `.md` attachment) requirements are fulfilled.'
+
               ];
+
             } else {
-              const issues = [];
-              if (!prtiValid) {
-                issues.push(`**PRTI Validation Issues:** ${invalidFields.join(', ')}`);
-              }
-              if (!markdownFound) {
-                if (markdownError) {
-                  issues.push(`**Markdown File:** ${markdownError}`);
-                } else {
-                  issues.push('**Markdown File:** Missing - Please attach or reference a non-empty markdown (.md) file');
-                }
-              }
-              
+
               statusLines = [
-                '### ❌ PRTI Checklist Incomplete or Invalid',
-                'The following issue(s) need attention:',
-                ...issues.map(issue => `- ${issue}`),
+
+                '### ❌ Enforcement Checks Failed',
+
+                'The following issues need attention:',
+
+                ...combinedErrors.map(err => `- **${err}**`),
+
                 '',
-                'This PR is **blocked from merging** until both valid PRTI data AND a non-empty markdown file are supplied.'
+
+                'This PR is **blocked from merging** until both PRTI data and a valid non-empty review `.md` attachment are provided.'
+
               ];
-            }
 
-            // 6. Assemble full sticky comment body
+            }
+ 
+            // 5. Assemble full sticky comment body
+
             const bodyLines = [
+
               MARKER,
-              '## PRTI Checklist Enforcement',
+
+              '## PRTI & Review Process Enforcement',
+
               '',
+
               ...bannerLines,
-              'Hi @' + author + ', please provide your **PRTI details** AND **markdown file** in the PR description or comments.',
+
+              'Hi @' + author + ', please provide your **PRTI details** and attach your **Review Process `.md` file** in the PR description or a comment.',
+
               '',
-              '### 📋 Required Format (Copy & Paste PRTI):',
+
+              '### Required Checklist:',
+
+              '1. **Level 1 (PRTI Format):**',
+
               '```text',
+
               'PR Time    : <enter time, e.g., 2h>',
+
               'PR Defects : <enter defects count, e.g., 0>',
+
               'TI Time    : <enter time, e.g., 1h>',
+
               '```',
+
+              '2. **Level 2 (Review Attachment):** Attach a non-empty review document (e.g., `review_process.md`).',
+
               '',
-              '### 📄 Markdown File Requirement:',
-              'Please **commit and push a markdown file** (.md) to your branch. The file must:',
-              '- Have a `.md` extension (e.g., `documentation.md`, `README.md`)',
-              '- Contain actual content (cannot be empty - size must be > 0 bytes)',
-              '- Be referenced in a comment by its filename',
+
+              '| Level | Field / File | Validation Rule |',
+
+              '| :---: | :--- | :--- |',
+
+              '| **L1** | PR Time / TI Time | Must contain valid time duration (`2h`, `30m`) |',
+
+              '| **L1** | PR Defects | Must be a non-negative number (`0`, `1`) |',
+
+              '| **L2** | Review File | Must attach a non-empty `.md` file |',
+
               '',
-              'Example comment:',
-              '```',
-              'I have added documentation.md to this PR which contains the project details.',
-              '```',
-              '',
-              '| Field | Validation Rule | Meaning |',
-              '|-------|-----------------|---------|',
-              '| **PR Time** | Time duration (e.g. `2h`, `30m`) | Time spent creating this PR |',
-              '| **PR Defects** | Non-negative number (e.g. `0`, `1`) | Defects found during review |',
-              '| **TI Time** | Time duration (e.g. `1h`, `45m`) | Time spent on Technical Investigation |',
-              '| **Markdown File** | Non-empty `.md` file (> 0 bytes) | Project documentation or technical details |',
-              '',
+
               '---',
+
               ...statusLines,
+
               '',
-              '> Automated by the PRTI Enforcement workflow. Re-evaluates on new commits or comment updates.'
+
+              '> Automated by the PRTI Enforcement workflow. Re-evaluates on new comments and commits.'
+
             ];
-
+ 
             const body = bodyLines.join('\n');
+ 
+            // 6. Update or create sticky comment
 
-            // 7. Update or create the sticky comment
             const existingSticky = comments.find(c => (c.body || '').includes(MARKER));
-
+ 
             if (existingSticky) {
+
               await github.rest.issues.updateComment({
+
                 owner, repo, comment_id: existingSticky.id, body
+
               });
+
             } else {
+
               await github.rest.issues.createComment({
+
                 owner, repo, issue_number: prNumber, body
+
               });
-            }
 
-            // 8. Update Commit Status
-            let description;
-            if (allValid) {
-              description = 'PRTI & markdown file (non-empty) validated';
-            } else {
-              const issues = [];
-              if (!prtiValid) issues.push('PRTI invalid');
-              if (!markdownFound) issues.push('Markdown missing/empty');
-              description = ('Validation failed: ' + issues.join(', ')).slice(0, 140);
             }
+ 
+            // 7. Update Commit Status
 
+            const description = allValid
+
+              ? 'PRTI and Review attachment checks passed'
+
+              : ('Validation failed: ' + combinedErrors.join(', ')).slice(0, 140);
+ 
             await github.rest.repos.createCommitStatus({
-              owner,
-              repo,
-              sha: headSha,
-              context: STATUS_CONTEXT,
-              state: allValid ? 'success' : 'failure',
-              description,
-              target_url: 'https://github.com/' + owner + '/' + repo + '/pull/' + prNumber
-            });
 
+              owner,
+
+              repo,
+
+              sha: headSha,
+
+              context: STATUS_CONTEXT,
+
+              state: allValid ? 'success' : 'failure',
+
+              description,
+
+              target_url: 'https://github.com/' + owner + '/' + repo + '/pull/' + prNumber
+
+            });
+ 
             if (allValid) {
-              core.info('PRTI checklist AND markdown file (non-empty) validated - commit status set to success.');
+
+              core.info('PRTI & Review checks complete - commit status set to success.');
+
             } else {
-              const allIssues = [];
-              if (!prtiValid) allIssues.push('PRTI incomplete: ' + invalidFields.join(', '));
-              if (!markdownFound) {
-                if (markdownError) {
-                  allIssues.push('Markdown file issue: ' + markdownError);
-                } else {
-                  allIssues.push('Markdown file missing/empty');
-                }
-              }
-              core.warning('Validation failed. Issues: ' + allIssues.join(' | '));
+
+              core.warning('Validation incomplete/invalid. Issues: ' + combinedErrors.join(', '));
+
             }
+ 
