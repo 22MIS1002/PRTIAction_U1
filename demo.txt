@@ -15,5 +15,3 @@ added this line for validation checks-03
 added this line for validation checks-04
 
 added this line for validation checks-05
-
-For md file
