@@ -20,3 +20,7 @@ added  md file
 
 
 added  md file check-02
+
+done with md feature
+
+Now user older comments should be flagged as invalid instead of deleted
