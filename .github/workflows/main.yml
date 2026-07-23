@@ -10,6 +10,7 @@ permissions:
   pull-requests: write
   issues: write
   statuses: write
+  contents: read
 
 jobs:
   prti-check:
@@ -19,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Validate PRTI data, update sticky comment, set commit status
+      - name: Validate PRTI data AND markdown file (non-empty), update sticky comment, set commit status
         uses: actions/github-script@v7
         with:
           script: |
@@ -52,6 +53,7 @@ jobs:
 
             const isSynchronize = context.eventName === 'pull_request' && context.payload.action === 'synchronize';
             const prtiRegex = /PR\s*Time|PR\s*Defects|TI\s*Time/i;
+            const markdownRegex = /\.md\b/i;
 
             // 1. Delete old PRTI comments on new commits
             if (isSynchronize) {
@@ -96,7 +98,7 @@ jobs:
               return null;
             }
 
-            // 3. Validation Logic Engine
+            // 3. Validation Logic Engine for PRTI fields
             const checks = [
               { label: 'PR Time',    re: /PR\s*Time\s*:\s*(.*)$/im,    type: 'time' },
               { label: 'PR Defects', re: /PR\s*Defects\s*:\s*(.*)$/im, type: 'number' },
@@ -140,23 +142,99 @@ jobs:
               }
             }
 
-            const allValid = invalidFields.length === 0;
+            const prtiValid = invalidFields.length === 0;
 
-            // 4. Build status message and contextual banners
+            // 4. NEW: Check for markdown file attachment in comments AND verify it's not empty
+            core.info('Checking for markdown file attachment in author comments...');
+            let markdownFound = false;
+            let markdownError = '';
+
+            for (const comment of comments) {
+              if (comment.user && comment.user.login === author && !(comment.body || '').includes(MARKER)) {
+                // Check if comment body mentions .md file
+                if (markdownRegex.test(comment.body)) {
+                  core.info(`Markdown file reference found in comment ID: ${comment.id}`);
+                  
+                  // Extract markdown filename from comment
+                  const mdFileMatch = comment.body.match(/([a-zA-Z0-9_\-\.]+\.md)/i);
+                  if (mdFileMatch) {
+                    const markdownFilename = mdFileMatch[1];
+                    core.info(`Attempting to validate markdown file: ${markdownFilename}`);
+                    
+                    try {
+                      // Try to fetch the file from the PR's head branch
+                      const { data: fileData } = await github.rest.repos.getContent({
+                        owner,
+                        repo,
+                        path: markdownFilename,
+                        ref: pr.head.ref
+                      });
+
+                      // Check if file exists and has content
+                      if (fileData.size > 0) {
+                        markdownFound = true;
+                        core.info(`✓ Markdown file '${markdownFilename}' found with size: ${fileData.size} bytes`);
+                        break;
+                      } else {
+                        markdownError = `Markdown file '${markdownFilename}' is empty (0 bytes)`;
+                        core.warning(markdownError);
+                      }
+                    } catch (error) {
+                      markdownError = `Markdown file '${markdownFilename}' not found in repository`;
+                      core.warning(markdownError);
+                    }
+                  }
+                }
+              }
+            }
+
+            // If no markdown in comments, check PR description for file references
+            if (!markdownFound && markdownRegex.test(pr.body || '')) {
+              core.info('Markdown file reference found in PR description');
+              const mdFileMatch = (pr.body || '').match(/([a-zA-Z0-9_\-\.]+\.md)/i);
+              if (mdFileMatch) {
+                const markdownFilename = mdFileMatch[1];
+                core.info(`Attempting to validate markdown file from PR description: ${markdownFilename}`);
+                
+                try {
+                  const { data: fileData } = await github.rest.repos.getContent({
+                    owner,
+                    repo,
+                    path: markdownFilename,
+                    ref: pr.head.ref
+                  });
+
+                  if (fileData.size > 0) {
+                    markdownFound = true;
+                    core.info(`✓ Markdown file '${markdownFilename}' found with size: ${fileData.size} bytes`);
+                  } else {
+                    markdownError = `Markdown file '${markdownFilename}' is empty (0 bytes)`;
+                    core.warning(markdownError);
+                  }
+                } catch (error) {
+                  markdownError = `Markdown file '${markdownFilename}' not found in repository`;
+                  core.warning(markdownError);
+                }
+              }
+            }
+
+            const allValid = prtiValid && markdownFound;
+
+            // 5. Build status message and contextual banners
             let bannerLines = [];
 
             if (isSynchronize) {
               bannerLines = [
                 '> 🔄 **New Commits Detected!**',
-                '> Previous PRTI data has been invalidated. Please submit updated PRTI details for this new revision.',
+                '> Previous PRTI data and markdown file references have been invalidated. Please submit updated PRTI details and markdown file for this new revision.',
                 ''
               ];
             } else if (context.eventName === 'issue_comment' && !allValid) {
               const latestCommentBody = context.payload.comment.body || '';
-              if (prtiRegex.test(latestCommentBody)) {
+              if (prtiRegex.test(latestCommentBody) || markdownRegex.test(latestCommentBody)) {
                 bannerLines = [
                   '> ⚠️ **Notice on your recent comment:**',
-                  '> We detected a PRTI submission attempt, but some fields failed validation.',
+                  '> We detected a submission attempt, but validation failed. Please check the requirements below.',
                   ''
                 ];
               }
@@ -165,32 +243,55 @@ jobs:
             let statusLines;
             if (allValid) {
               statusLines = [
-                '### PRTI Checklist Complete',
-                'All required PRTI fields were detected and validated for the current revision. Thank you!'
+                '### ✅ PRTI Checklist Complete',
+                'All required PRTI fields were detected and validated, AND markdown file (non-empty) has been provided for the current revision. Thank you!'
               ];
             } else {
+              const issues = [];
+              if (!prtiValid) {
+                issues.push(`**PRTI Validation Issues:** ${invalidFields.join(', ')}`);
+              }
+              if (!markdownFound) {
+                if (markdownError) {
+                  issues.push(`**Markdown File:** ${markdownError}`);
+                } else {
+                  issues.push('**Markdown File:** Missing - Please attach or reference a non-empty markdown (.md) file');
+                }
+              }
+              
               statusLines = [
-                '### PRTI Checklist Incomplete or Invalid',
+                '### ❌ PRTI Checklist Incomplete or Invalid',
                 'The following issue(s) need attention:',
-                ...invalidFields.map(err => `- **${err}**`),
+                ...issues.map(issue => `- ${issue}`),
                 '',
-                'This PR is **blocked from merging** until valid PRTI data is supplied.'
+                'This PR is **blocked from merging** until both valid PRTI data AND a non-empty markdown file are supplied.'
               ];
             }
 
-            // 5. Assemble full sticky comment body
+            // 6. Assemble full sticky comment body
             const bodyLines = [
               MARKER,
               '## PRTI Checklist Enforcement',
               '',
               ...bannerLines,
-              'Hi @' + author + ', please provide your **PRTI details** in the PR description or a comment.',
+              'Hi @' + author + ', please provide your **PRTI details** AND **markdown file** in the PR description or comments.',
               '',
-              '### Required Format (Copy & Paste):',
+              '### 📋 Required Format (Copy & Paste PRTI):',
               '```text',
               'PR Time    : <enter time, e.g., 2h>',
               'PR Defects : <enter defects count, e.g., 0>',
               'TI Time    : <enter time, e.g., 1h>',
+              '```',
+              '',
+              '### 📄 Markdown File Requirement:',
+              'Please **commit and push a markdown file** (.md) to your branch. The file must:',
+              '- Have a `.md` extension (e.g., `documentation.md`, `README.md`)',
+              '- Contain actual content (cannot be empty - size must be > 0 bytes)',
+              '- Be referenced in a comment by its filename',
+              '',
+              'Example comment:',
+              '```',
+              'I have added documentation.md to this PR which contains the project details.',
               '```',
               '',
               '| Field | Validation Rule | Meaning |',
@@ -198,16 +299,17 @@ jobs:
               '| **PR Time** | Time duration (e.g. `2h`, `30m`) | Time spent creating this PR |',
               '| **PR Defects** | Non-negative number (e.g. `0`, `1`) | Defects found during review |',
               '| **TI Time** | Time duration (e.g. `1h`, `45m`) | Time spent on Technical Investigation |',
+              '| **Markdown File** | Non-empty `.md` file (> 0 bytes) | Project documentation or technical details |',
               '',
               '---',
               ...statusLines,
               '',
-              '> Automated by the PRTI Enforcement workflow. Re-evaluates on new commits.'
+              '> Automated by the PRTI Enforcement workflow. Re-evaluates on new commits or comment updates.'
             ];
 
             const body = bodyLines.join('\n');
 
-            // 6. Update or create the sticky comment
+            // 7. Update or create the sticky comment
             const existingSticky = comments.find(c => (c.body || '').includes(MARKER));
 
             if (existingSticky) {
@@ -220,10 +322,16 @@ jobs:
               });
             }
 
-            // 7. Update Commit Status
-            const description = allValid
-              ? 'PRTI checklist complete'
-              : ('Validation failed: ' + invalidFields.join(', ')).slice(0, 140);
+            // 8. Update Commit Status
+            let description;
+            if (allValid) {
+              description = 'PRTI & markdown file (non-empty) validated';
+            } else {
+              const issues = [];
+              if (!prtiValid) issues.push('PRTI invalid');
+              if (!markdownFound) issues.push('Markdown missing/empty');
+              description = ('Validation failed: ' + issues.join(', ')).slice(0, 140);
+            }
 
             await github.rest.repos.createCommitStatus({
               owner,
@@ -236,7 +344,16 @@ jobs:
             });
 
             if (allValid) {
-              core.info('PRTI checklist complete - commit status set to success.');
+              core.info('PRTI checklist AND markdown file (non-empty) validated - commit status set to success.');
             } else {
-              core.warning('PRTI checklist incomplete or invalid. Issues: ' + invalidFields.join(', '));
+              const allIssues = [];
+              if (!prtiValid) allIssues.push('PRTI incomplete: ' + invalidFields.join(', '));
+              if (!markdownFound) {
+                if (markdownError) {
+                  allIssues.push('Markdown file issue: ' + markdownError);
+                } else {
+                  allIssues.push('Markdown file missing/empty');
+                }
+              }
+              core.warning('Validation failed. Issues: ' + allIssues.join(' | '));
             }
