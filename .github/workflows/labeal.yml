@@ -1,0 +1,627 @@
+name: PR Review Comment Classifier
+
+on:
+  pull_request_review_comment:
+    types:
+      - created
+      - edited
+
+permissions:
+  pull-requests: write
+
+jobs:
+  review-comment-classifier:
+
+    if: github.event.comment.user.login != 'github-actions[bot]'
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Validate Review Comment
+
+        uses: actions/github-script@v7
+
+        with:
+
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+          script: |
+
+            /*************************************************************
+             * CONTEXT
+             *************************************************************/
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const pullNumber =
+              context.payload.pull_request.number;
+
+            const comment =
+              context.payload.comment;
+
+            const commentId =
+              comment.id;
+
+            const reviewer =
+              comment.user.login;
+
+            const rawBody =
+              comment.body || "";
+
+            console.log("=================================");
+            console.log("Comment ID :", commentId);
+            console.log("Reviewer   :", reviewer);
+            console.log("=================================");
+
+            /*************************************************************
+             * NORMALIZE MARKDOWN
+             *
+             * GitHub Saved Replies may contain:
+             * **bold**
+             * > quote
+             * - bullets
+             * # headings
+             * `code`
+             *************************************************************/
+
+            function normalizeComment(text){
+
+              return text
+
+                // remove html
+                .replace(/<[^>]*>/g," ")
+
+                // remove markdown
+                .replace(/[*_`>#-]/g," ")
+
+                // remove CR
+                .replace(/\r/g," ")
+
+                // remove new lines
+                .replace(/\n/g," ")
+
+                // collapse whitespace
+                .replace(/\s+/g," ")
+
+                .toUpperCase()
+
+                .trim();
+
+            }
+
+            const normalized =
+              normalizeComment(rawBody);
+
+            console.log(normalized);
+
+            /*************************************************************
+             * LABELS
+             *************************************************************/
+
+            const RANKING = [
+
+              "MAJOR",
+              "MINOR"
+
+            ];
+
+            const CLASSIFICATIONS = [
+
+              "MISSING",
+              "EXTRA/SUPERFLUOUS",
+              "AMBIGUOUS",
+              "INCONSISTENT",
+              "IMPROVEMENT DESIRABLE",
+              "NOT CONFORMING TO STANDARDS",
+              "RISK-PRONE",
+              "FACTUALLY INCORRECT",
+              "NOT IMPLEMENTABLE",
+              "EDITORIAL"
+
+            ];
+
+            /*************************************************************
+             * EXTRACT STATE
+             *************************************************************/
+
+            function extractState(text){
+
+              const state = {
+
+                type: null,
+
+                ranking: null,
+
+                classification: null
+
+              };
+
+              /*
+               * TYPE
+               */
+
+              if(/\[QUESTION\]/i.test(text)){
+
+                state.type = "QUESTION";
+
+              }
+
+              if(/\[DEFECT\]/i.test(text)){
+
+                state.type = "DEFECT";
+
+              }
+
+              /*
+               * RANKING
+               */
+
+              for(const ranking of RANKING){
+
+                const regex =
+                  new RegExp("\\[" + ranking + "\\]","i");
+
+                if(regex.test(text)){
+
+                  state.ranking = ranking;
+
+                  break;
+
+                }
+
+              }
+
+              /*
+               * CLASSIFICATION
+               */
+
+              for(const classification of CLASSIFICATIONS){
+
+                const escaped =
+                  classification.replace("/","\\/");
+
+                const regex =
+                  new RegExp("\\[" + escaped + "\\]","i");
+
+                if(regex.test(text)){
+
+                  state.classification =
+                    classification;
+
+                  break;
+
+                }
+
+              }
+
+              return state;
+
+            }
+
+            const state =
+              extractState(normalized);
+
+            console.log("STATE");
+
+            console.log(JSON.stringify(state,null,2));
+
+            /*************************************************************
+             * UNIQUE MARKER
+             *************************************************************/
+
+            const marker =
+              `<!-- review-classifier:${commentId} -->`;
+                          /*************************************************************
+             * BOT REPLY MANAGER
+             *************************************************************/
+
+            /**
+             * Find existing bot reply for this review comment.
+             * Uses the hidden marker instead of in_reply_to_id because
+             * GitHub does not reliably preserve reply relationships.
+             */
+            async function findBotReply() {
+
+              let page = 1;
+
+              while (true) {
+
+                const response =
+                  await github.rest.pulls.listReviewComments({
+
+                    owner,
+                    repo,
+                    pull_number: pullNumber,
+                    per_page: 100,
+                    page
+
+                  });
+
+                const botReply = response.data.find(c =>
+
+                  c.user.login === "github-actions[bot]" &&
+                  c.body &&
+                  c.body.includes(marker)
+
+                );
+
+                if (botReply) {
+
+                  console.log(
+                    `Found bot reply ${botReply.id}`
+                  );
+
+                  return botReply;
+
+                }
+
+                if (response.data.length < 100) {
+
+                  break;
+
+                }
+
+                page++;
+
+              }
+
+              console.log("No existing bot reply.");
+
+              return null;
+
+            }
+
+            /*************************************************************
+             * CREATE REPLY
+             *************************************************************/
+
+            async function createReply(message){
+
+              console.log("Creating bot reply...");
+
+              await github.rest.pulls.createReplyForReviewComment({
+
+                owner,
+                repo,
+                pull_number: pullNumber,
+
+                comment_id: commentId,
+
+                body:
+
+                `${marker}
+
+                ${message}`
+
+              });
+
+            }
+
+            /*************************************************************
+             * UPDATE REPLY
+             *************************************************************/
+
+            async function updateReply(
+
+              replyId,
+              message
+
+            ){
+
+              console.log(
+
+                `Updating bot reply ${replyId}`
+
+              );
+
+              await github.rest.pulls.updateReviewComment({
+
+                owner,
+                repo,
+
+                comment_id: replyId,
+
+                body:
+
+                `${marker}
+
+                ${message}`
+
+              });
+
+            }
+
+            /*************************************************************
+             * DELETE REPLY
+             *************************************************************/
+
+            async function deleteReply(replyId){
+
+              console.log(
+
+                `Deleting bot reply ${replyId}`
+
+              );
+
+              await github.rest.pulls.deleteReviewComment({
+
+                owner,
+                repo,
+
+                comment_id: replyId
+
+              });
+
+            }
+
+            /*************************************************************
+             * SYNCHRONIZE BOT REPLY
+             *
+             * message == ""
+             *     delete reminder
+             *
+             * message != ""
+             *     update reminder
+             *     create reminder if missing
+             *************************************************************/
+
+            async function syncBotReply(message){
+
+              const existing =
+                await findBotReply();
+
+              const trimmed =
+                message.trim();
+
+              /*
+               * No reminder needed
+               */
+
+              if(trimmed.length === 0){
+
+                if(existing){
+
+                  await deleteReply(existing.id);
+
+                }
+
+                return;
+
+              }
+
+              /*
+               * Update reminder
+               */
+
+              if(existing){
+
+                if(existing.body.includes(trimmed)){
+
+                  console.log(
+                    "Reminder already up-to-date."
+                  );
+
+                  return;
+
+                }
+
+                await updateReply(
+
+                  existing.id,
+
+                  trimmed
+
+                );
+
+                return;
+
+              }
+
+              /*
+               * Create reminder
+               */
+
+              await createReply(trimmed);
+
+            }
+
+            console.log(
+              "Bot Reply Manager initialized."
+            );
+                        /*************************************************************
+             * BUILD DYNAMIC REMINDER
+             *************************************************************/
+
+            function buildReminder(state){
+
+              /*
+               * Empty reminder means
+               * the comment is valid.
+               */
+
+              let reminder = "";
+
+              /*******************************************************
+               * CASE 1
+               * No Type
+               *******************************************************/
+
+              if(state.type === null){
+
+                reminder =
+                `👋 @${reviewer}
+
+                Your review comment is missing a **Type**.
+
+                Please add ONE of the following labels at the beginning of your review comment.
+
+                | Type | Description |
+                |------|-------------|
+                | \`**[QUESTION]**\` | Ask for clarification |
+                | \`**[DEFECT]**\` | Report an issue |
+
+                > If you choose **[DEFECT]**, you must also provide one Ranking and one Classification.
+
+                _Edit your review comment. This reminder will update automatically._`;
+
+                return reminder;
+
+              }
+
+              /*******************************************************
+               * CASE 2
+               * QUESTION
+               *******************************************************/
+
+              if(state.type === "QUESTION"){
+
+                /*
+                 * QUESTION requires nothing else.
+                 */
+
+                return "";
+
+              }
+
+              /*******************************************************
+               * CASE 3
+               * DEFECT
+               *******************************************************/
+
+              reminder =
+              `👋 @${reviewer}
+
+              Your **[DEFECT]** review comment is not fully classified.
+
+              `;
+
+              /*******************************************************
+               * Missing Ranking
+               *******************************************************/
+
+              if(state.ranking === null){
+
+                reminder +=
+                `
+                ## ❌ Ranking Missing
+
+                Choose exactly one.
+
+                | Label | Meaning |
+                |------|---------|
+                | \`🔴 **[MAJOR]**\` | Must be fixed before merge |
+                | \`🟡 **[MINOR]**\` | Small issue with lower impact |
+
+                `;
+
+              }
+
+              /*******************************************************
+               * Missing Classification
+               *******************************************************/
+
+              if(state.classification === null){
+
+                reminder +=
+                `
+                ## ❌ Classification Missing
+
+                Choose exactly one.
+
+                | Label | Meaning |
+                |------|---------|
+                | \`**[MISSING]**\` | Required code is missing |
+                | \`**[EXTRA/SUPERFLUOUS]**\` | Unnecessary implementation |
+                | \`**[AMBIGUOUS]**\` | Unclear implementation |
+                | \`**[INCONSISTENT]**\` | Inconsistent behaviour |
+                | \`**[IMPROVEMENT DESIRABLE]**\` | Improvement suggested |
+                | \`**[NOT CONFORMING TO STANDARDS]**\` | Coding standard violation |
+                | \`**[RISK-PRONE]**\` | Risky implementation |
+                | \`**[FACTUALLY INCORRECT]**\` | Incorrect behaviour |
+                | \`**[NOT IMPLEMENTABLE]**\` | Suggestion cannot be implemented |
+                | \`**[EDITORIAL]**\` | Grammar / formatting issue |
+
+                `;
+
+              }
+
+              /*******************************************************
+               * Footer
+               *******************************************************/
+
+              reminder +=
+                `
+                ---
+
+                ### Current Status
+
+                | Requirement | Status |
+                |------------|--------|
+                | Type | ✅ ${state.type} |
+                | Ranking | ${state.ranking ? "✅ " + state.ranking : "❌ Missing"} |
+                | Classification | ${state.classification ? "✅ " + state.classification : "❌ Missing"} |
+
+                _Edit your review comment. This reminder will update automatically after every edit._`;
+
+              /*
+               * DEFECT complete
+               */
+
+              if(
+                state.ranking !== null &&
+                state.classification !== null
+              ){
+
+                return "";
+
+              }
+
+              return reminder;
+
+            }
+
+            /*************************************************************
+             * GENERATE REMINDER
+             *************************************************************/
+
+            const reminder =
+              buildReminder(state);
+
+            console.log("Generated Reminder:");
+
+            console.log(reminder);
+                        /*************************************************************
+             * SYNCHRONIZE BOT REPLY
+             *************************************************************/
+
+            console.log("======================================");
+            console.log("Current State");
+            console.log(JSON.stringify(state, null, 2));
+            console.log("======================================");
+
+            if (reminder === "") {
+
+              console.log("Comment is fully valid.");
+
+            } else {
+
+              console.log("Reminder required.");
+
+            }
+
+            /*
+             * This single function handles everything:
+             *
+             * reminder == ""
+             *     -> delete existing reminder
+             *
+             * reminder != ""
+             *     -> update reminder
+             *     -> create reminder if none exists
+             */
+
+            await syncBotReply(reminder);
+
+            console.log("Workflow completed successfully.");
